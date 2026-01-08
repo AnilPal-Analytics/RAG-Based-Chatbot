@@ -1,86 +1,175 @@
+# ======================================================
+# ENTERPRISE-STYLE RAG BASED PDF CHATBOT (SINGLE FILE)
+# ======================================================
+
 import os
-import google.generativeai as genai
-from langchain_community.vectorstores import FAISS  # Vector database wrapper
-from langchain_community.embeddings import HuggingFaceEmbeddings  # Word embeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter  # Chunking
-
-from pypdf import PdfReader
-# import faiss  # Not needed, FAISS wrapper from LangChain is enough
 import streamlit as st
-from pdfextractor import text_extractor_pdf  # Custom PDF text extractor
+import google.generativeai as genai
 
-#  Load environment variables from .env
 from dotenv import load_dotenv
+from pypdf import PdfReader
+
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# ------------------------------------------------------
+# ENV & MODEL CONFIGURATION
+# ------------------------------------------------------
 load_dotenv()
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+llm = genai.GenerativeModel("gemini-2.5-flash-lite")
 
-# Create the main page
-st.title(':green[RAG Based CHATBOT]')
-tips = """Follow the steps to use this application:
-* Upload your PDF document in the sidebar.
-* Write your query and start chatting with the bot."""
-st.subheader(tips)
+# ------------------------------------------------------
+# PDF TEXT EXTRACTION
+# ------------------------------------------------------
+def extract_pdf_text(file):
+    reader = PdfReader(file)
+    text = ""
+    for page in reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text
+    return text
 
-# Load PDF in Sidebar
-st.sidebar.title(':orange[UPLOAD YOUR DOCUMENT HERE (PDF Only)]')
-file_uploaded = st.sidebar.file_uploader('Upload File', type=['pdf'])  # restrict to PDF only
+# ------------------------------------------------------
+# VECTOR STORE CREATION
+# ------------------------------------------------------
+def build_vector_store(text):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=900,
+        chunk_overlap=250
+    )
+    chunks = splitter.split_text(text)
 
-if file_uploaded:
-    file_text = text_extractor_pdf(file_uploaded)  # works with BytesIO object
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
 
-    # Step 1: Configure the models
-    key = os.getenv('GOOGLE_API_KEY')
-    genai.configure(api_key=key)
-    llm_model = genai.GenerativeModel('gemini-2.5-flash-lite')
+    return FAISS.from_texts(chunks, embeddings)
 
-    # Step 2: Configure Embedding Model
-    embedding_model = HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2')
+# ------------------------------------------------------
+# RAG RESPONSE GENERATION
+# ------------------------------------------------------
+def rag_answer(query, retriever):
+    docs = retriever.invoke(query)
+    context = " ".join(doc.page_content for doc in docs)
 
-    # Step 3: Chunking (Create Chunks)
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
-    chunks = splitter.split_text(file_text)
+    prompt = f"""
+You are a professional AI assistant.
 
-    # Step 4: Create FAISS Vector Store
-    vector_store = FAISS.from_texts(chunks, embedding_model)
+Answer the user's question strictly using the information provided
+in the context below. If the answer is not present, say:
+"I could not find this information in the document."
 
-    # Step 5: Configure retriever
-    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+Context:
+{context}
 
-    # Function to generate response
-    def generate_response(query: str) -> str:
-        # Retrieval
-        retrieved_docs = retriever.invoke(query)  # instead of get_relevant_documents
-        context = ' '.join([doc.page_content for doc in retrieved_docs])
+Question:
+{query}
 
-        # Augmented prompt
-        prompt = f"""
-        You are a helpful assistant using RAG.
-        Context: {context}
-        User Query: {query}
-        """
+Answer:
+"""
 
-        # Generation
-        content = llm_model.generate_content(prompt)
-        return content.text if hasattr(content, "text") else content.candidates[0].content.parts[0].text
+    response = llm.generate_content(prompt)
+    return response.text.strip()
 
-    # Initialize chat if there is no history
-    if 'history' not in st.session_state:
-        st.session_state.history = []
+# ======================================================
+# STREAMLIT UI
+# ======================================================
 
-    # Display the History
-    for msg in st.session_state.history:
-        if msg['role'] == 'user':
-            st.write(f':green[User:] :blue[{msg["text"]}]')
-        else:
-            st.write(f':orange[Chatbot:] {msg["text"]}')
+st.set_page_config(
+    page_title="RAG PDF Chatbot",
+    layout="wide"
+)
 
-    # Input from the user (Using Streamlit Form)
-    with st.form('Chat Form', clear_on_submit=True):
-        user_input = st.text_input('Enter Your Text Here:')
-        send = st.form_submit_button('Send')
+# ------------------ HEADER ----------------------------
+st.markdown(
+    """
+    <h1 style="text-align:center; color:#1F4FD8;">🤖 RAG-Based Document Chatbot</h1>
+    <p style="text-align:center; color:gray;">
+    Ask accurate questions from your PDF using Retrieval-Augmented Generation
+    </p>
+    """,
+    unsafe_allow_html=True
+)
 
-    # Start the conversation and append the output and query in history
-    if user_input and send:
-        st.session_state.history.append({"role": 'user', "text": user_input})
-        model_output = generate_response(user_input)
-        st.session_state.history.append({'role': 'chatbot', 'text': model_output})
+# ------------------ SIDEBAR ---------------------------
+st.sidebar.markdown("## 📄 Document Upload")
+st.sidebar.markdown(
+    "Upload a **PDF document** to activate document-aware chat."
+)
+
+uploaded_file = st.sidebar.file_uploader(
+    "Select PDF File",
+    type=["pdf"]
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### ⚙️ System Status")
+
+# ------------------ SESSION STATE ---------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "retriever" not in st.session_state:
+    st.session_state.retriever = None
+
+# ------------------ DOCUMENT PROCESSING ---------------
+if uploaded_file and st.session_state.retriever is None:
+    with st.spinner("Analyzing document and building knowledge base..."):
+        pdf_text = extract_pdf_text(uploaded_file)
+        vector_db = build_vector_store(pdf_text)
+        st.session_state.retriever = vector_db.as_retriever(
+            search_kwargs={"k": 3}
+        )
+
+    st.sidebar.success("Document processed ✔")
+
+elif st.session_state.retriever:
+    st.sidebar.success("Ready for questions ✔")
+else:
+    st.sidebar.warning("Waiting for PDF upload")
+
+# ------------------ CHAT AREA -------------------------
+st.markdown("### 💬 Chat Interface")
+
+for msg in st.session_state.messages:
+    if msg["role"] == "user":
+        st.markdown(
+            f"<div style='background:#e8f5e9; padding:10px; border-radius:8px;'><b>You:</b> {msg['text']}</div>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            f"<div style='background:#f1f1f1; padding:10px; border-radius:8px;'><b>Assistant:</b> {msg['text']}</div>",
+            unsafe_allow_html=True
+        )
+
+# ------------------ USER INPUT ------------------------
+if st.session_state.retriever:
+    with st.form("chat_form", clear_on_submit=True):
+        user_query = st.text_input(
+            "Ask a question based on the uploaded document"
+        )
+        send = st.form_submit_button("Send")
+
+    if send and user_query:
+        st.session_state.messages.append(
+            {"role": "user", "text": user_query}
+        )
+
+        with st.spinner("Generating answer..."):
+            answer = rag_answer(
+                user_query,
+                st.session_state.retriever
+            )
+
+        st.session_state.messages.append(
+            {"role": "assistant", "text": answer}
+        )
+
         st.rerun()
+else:
+    st.info("Upload a PDF from the sidebar to begin.")
+
